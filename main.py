@@ -1,11 +1,11 @@
 """
-main.py - RAG Query System and FastAPI Server
-Handles querying, AI responses, and API endpoints
+main.py - RAG Query System and FastAPI Server with Data Analysis
+Handles querying, AI responses, API endpoints, and comprehensive data analysis
 """
 
 import os
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pathlib import Path
 
 # FastAPI and web
@@ -21,8 +21,9 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# Import our ingestion system
+# Import our systems
 from ingest import DocumentIngestion
+from data_analysis import DataAnalysisSystem
 
 # ---------- CONFIG ----------
 CHROMA_DIR = "./chroma_db"
@@ -243,16 +244,32 @@ Your detailed response:"""
 
         return result
 
+    def get_query_stats(self) -> Dict:
+        """Get query system statistics"""
+        try:
+            collection_count = self.collection.count()
+        except:
+            collection_count = 0
+        
+        return {
+            "total_chunks_in_db": collection_count,
+            "embedding_model": EMBED_MODEL,
+            "ai_model": GEMINI_MODEL,
+            "top_k": TOP_K,
+            "relevance_threshold": RELEVANCE_THRESHOLD
+        }
+
 
 # === FastAPI setup ===
-print("Initializing RAG Query System...")
+print("Initializing Enhanced RAG System with Data Analysis...")
 query_system = QuerySystem()
-print("Query system initialized successfully!")
+data_analysis_system = DataAnalysisSystem()
+print("Systems initialized successfully!")
 
 app = FastAPI(
-    title="Advanced RAG System",
-    description="Document ingestion and intelligent querying system with AI agent capabilities",
-    version="2.0.0"
+    title="Enhanced RAG System with Data Analysis",
+    description="Document ingestion, intelligent querying, and comprehensive data analysis system",
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -275,13 +292,31 @@ class FileRemoveRequest(BaseModel):
 class BulkIngestRequest(BaseModel):
     directory_path: str
 
+class MLTrainingRequest(BaseModel):
+    file_id: str
+    target_column: str
+    task_type: str = "auto"  # "auto", "classification", "regression"
 
+class ClusteringRequest(BaseModel):
+    file_id: str
+    n_clusters: Optional[int] = None
+
+class GANVisualizationRequest(BaseModel):
+    file_id: str
+    columns: Optional[List[str]] = None
+
+class AdvancedVisualizationRequest(BaseModel):
+    file_id: str
+    chart_types: Optional[List[str]] = None
+
+
+# === RAG Endpoints ===
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
 
-    allowed_extensions = {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt'}
+    allowed_extensions = {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.csv', '.xlsx', '.xls'}
     file_ext = Path(file.filename).suffix.lower()
 
     if file_ext not in allowed_extensions:
@@ -291,9 +326,23 @@ async def upload_file(file: UploadFile = File(...)):
         )
 
     try:
-        print(f"\n📁 Received upload request for: {file.filename}")
+        print(f"\n📄 Received upload request for: {file.filename}")
         content = await file.read()
-        result = query_system.ingestion.ingest_document(content, file.filename)
+        
+        # Standard document ingestion for text-based files
+        if file_ext in {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt'}:
+            result = query_system.ingestion.ingest_document(content, file.filename)
+        else:
+            # For CSV/Excel, only add to file manager without text extraction
+            result = query_system.ingestion.file_manager.add_file(content, file.filename)
+            
+            # Register for data analysis if it's a data file
+            if file_ext in {'.csv', '.xlsx', '.xls'} and result["status"] in ["added", "duplicate"]:
+                file_id = result["file_id"]
+                file_path = query_system.ingestion.file_manager.get_file_info(file_id)["file_path"]
+                data_result = data_analysis_system.register_data_file(file_id, file_path)
+                result["data_analysis_registration"] = data_result
+        
         return JSONResponse(content=result)
     except Exception as e:
         print(f"❌ Upload failed: {str(e)}")
@@ -331,6 +380,10 @@ async def remove_file(request: FileRemoveRequest):
     try:
         print(f"\n🗑️ Removing file: {request.file_id}")
         result = query_system.ingestion.remove_document(request.file_id)
+        
+        # Also cleanup data analysis if it exists
+        data_analysis_system.cleanup_analysis(request.file_id)
+        
         return JSONResponse(content=result)
     except Exception as e:
         print(f"❌ Remove failed: {str(e)}")
@@ -355,17 +408,136 @@ async def bulk_ingest(request: BulkIngestRequest):
         raise HTTPException(status_code=500, detail=f"Bulk ingest failed: {str(e)}")
 
 
+# === Data Analysis Endpoints ===
+@app.post("/data-analysis/eda")
+async def perform_eda(file_id: str):
+    """Perform Exploratory Data Analysis on uploaded CSV/Excel file"""
+    try:
+        print(f"\n📊 Performing EDA for file: {file_id}")
+        result = data_analysis_system.perform_eda(file_id)
+        return JSONResponse(content=result)
+    except Exception as e:
+        print(f"❌ EDA failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"EDA failed: {str(e)}")
+
+
+@app.post("/data-analysis/ml-training")
+async def train_ml_models(request: MLTrainingRequest):
+    """Train machine learning models on the dataset"""
+    try:
+        print(f"\n🤖 Training ML models for file: {request.file_id}, target: {request.target_column}")
+        result = data_analysis_system.train_ml_models(
+            request.file_id, 
+            request.target_column, 
+            request.task_type
+        )
+        return JSONResponse(content=result)
+    except Exception as e:
+        print(f"❌ ML training failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"ML training failed: {str(e)}")
+
+
+@app.post("/data-analysis/clustering")
+async def perform_clustering(request: ClusteringRequest):
+    """Perform clustering analysis on the dataset"""
+    try:
+        print(f"\n🎯 Performing clustering for file: {request.file_id}")
+        result = data_analysis_system.perform_clustering(request.file_id, request.n_clusters)
+        return JSONResponse(content=result)
+    except Exception as e:
+        print(f"❌ Clustering failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Clustering failed: {str(e)}")
+
+
+@app.post("/data-analysis/gan-visualization")
+async def generate_gan_visualization(request: GANVisualizationRequest):
+    """Generate GAN-based data visualization"""
+    try:
+        print(f"\n🎨 Generating GAN visualization for file: {request.file_id}")
+        result = data_analysis_system.generate_gan_visualization(request.file_id, request.columns)
+        return JSONResponse(content=result)
+    except Exception as e:
+        print(f"❌ GAN visualization failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"GAN visualization failed: {str(e)}")
+
+
+@app.post("/data-analysis/advanced-visualizations")
+async def create_advanced_visualizations(request: AdvancedVisualizationRequest):
+    """Create advanced data visualizations"""
+    try:
+        print(f"\n📈 Creating advanced visualizations for file: {request.file_id}")
+        result = data_analysis_system.create_advanced_visualizations(request.file_id, request.chart_types)
+        return JSONResponse(content=result)
+    except Exception as e:
+        print(f"❌ Advanced visualization failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Advanced visualization failed: {str(e)}")
+
+
+@app.get("/data-analysis/insights/{file_id}")
+async def get_data_insights(file_id: str):
+    """Get AI-powered insights about the dataset"""
+    try:
+        print(f"\n🧠 Generating insights for file: {file_id}")
+        result = data_analysis_system.get_data_insights(file_id)
+        return JSONResponse(content=result)
+    except Exception as e:
+        print(f"❌ Insights generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Insights generation failed: {str(e)}")
+
+
+@app.get("/data-analysis/history")
+async def get_analysis_history(file_id: str = None):
+    """Get history of all analyses performed"""
+    try:
+        result = data_analysis_system.get_analysis_history(file_id)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get analysis history: {str(e)}")
+
+
+@app.get("/data-analysis/export/{analysis_key}")
+async def export_analysis_results(analysis_key: str, format_type: str = "json"):
+    """Export analysis results in specified format"""
+    try:
+        result = data_analysis_system.export_results(analysis_key, format_type)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+@app.delete("/data-analysis/cleanup/{file_id}")
+async def cleanup_data_analysis(file_id: str):
+    """Clean up analysis data for a specific file"""
+    try:
+        result = data_analysis_system.cleanup_analysis(file_id)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+
+# === System Endpoints ===
 @app.get("/stats")
 async def get_stats():
     try:
         ingestion_stats = query_system.ingestion.get_ingestion_stats()
         query_stats = query_system.get_query_stats()
+        
+        # Get data analysis stats
+        data_analysis_stats = {
+            "registered_data_files": len(data_analysis_system.data_files),
+            "total_analyses_performed": len(data_analysis_system.analysis_results),
+            "available_analysis_types": [
+                "EDA", "ML Training", "Clustering", "GAN Visualization", 
+                "Advanced Visualizations", "Data Insights"
+            ]
+        }
 
         combined_stats = {
             "system_status": "operational",
             "timestamp": datetime.now().isoformat(),
             "ingestion": ingestion_stats,
-            "querying": query_stats
+            "querying": query_stats,
+            "data_analysis": data_analysis_stats
         }
         return JSONResponse(content=combined_stats)
     except Exception as e:
@@ -394,18 +566,29 @@ async def health_check():
         health_status["components"]["ai_models"] = f"unhealthy: {str(e)}"
         health_status["status"] = "degraded"
 
+    try:
+        # Test data analysis system
+        len(data_analysis_system.data_files)
+        health_status["components"]["data_analysis"] = "healthy"
+    except Exception as e:
+        health_status["components"]["data_analysis"] = f"unhealthy: {str(e)}"
+        health_status["status"] = "degraded"
+
     return JSONResponse(content=health_status)
 
 
+# === Enhanced CLI Interface ===
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Advanced RAG System Server")
+    parser = argparse.ArgumentParser(description="Enhanced RAG System with Data Analysis")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
     parser.add_argument("--query", type=str, help="Run a single query from command line")
     parser.add_argument("--interactive", action="store_true", help="Start interactive query mode")
+    parser.add_argument("--analyze-data", type=str, help="Perform data analysis on a CSV/Excel file")
+    parser.add_argument("--data-insights", type=str, help="Get insights for a registered data file")
 
     args = parser.parse_args()
 
@@ -439,5 +622,55 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"❌ Error: {str(e)}")
 
+    elif args.analyze_data:
+        print(f"\n📊 Analyzing data file: {args.analyze_data}")
+        try:
+            # Register the file
+            file_path = Path(args.analyze_data)
+            if not file_path.exists():
+                print("❌ File not found!")
+            else:
+                file_id = f"cli_{file_path.stem}"
+                register_result = data_analysis_system.register_data_file(file_id, str(file_path))
+                if register_result["status"] == "success":
+                    print("✅ File registered successfully")
+                    
+                    # Perform EDA
+                    print("🔍 Performing EDA...")
+                    eda_result = data_analysis_system.perform_eda(file_id)
+                    if eda_result["status"] == "success":
+                        stats = eda_result["summary_statistics"]["dataset_info"]
+                        print(f"📊 Dataset: {stats['shape'][0]} rows, {stats['shape'][1]} columns")
+                        print(f"💾 Memory usage: {stats['memory_usage_mb']} MB")
+                        print("✅ EDA completed successfully")
+                    else:
+                        print(f"❌ EDA failed: {eda_result.get('message', 'Unknown error')}")
+                else:
+                    print(f"❌ File registration failed: {register_result.get('message', 'Unknown error')}")
+        except Exception as e:
+            print(f"❌ Error: {str(e)}")
+
+    elif args.data_insights:
+        print(f"\n🧠 Generating insights for file: {args.data_insights}")
+        try:
+            result = data_analysis_system.get_data_insights(args.data_insights)
+            if result["status"] == "success":
+                insights = result["insights"]
+                print(f"📊 Dataset Overview:")
+                print(f"   - Rows: {insights['dataset_overview']['total_rows']}")
+                print(f"   - Columns: {insights['dataset_overview']['total_columns']}")
+                print(f"   - Data Quality Score: {insights['data_quality']['completeness_score']:.1f}%")
+                print(f"🔍 Recommendations: {len(insights['recommendations'])}")
+                for i, rec in enumerate(insights['recommendations'][:3], 1):
+                    print(f"   {i}. {rec}")
+            else:
+                print(f"❌ Insights generation failed: {result.get('message', 'Unknown error')}")
+        except Exception as e:
+            print(f"❌ Error: {str(e)}")
+
     else:
+        print("\n🚀 Starting Enhanced RAG System Server...")
+        print(f"📊 Data Analysis Features: Enabled")
+        print(f"🤖 AI Agent: Enabled")
+        print(f"🔍 RAG System: Enabled")
         uvicorn.run("main:app", host=args.host, port=args.port, reload=args.reload, log_level="info")
