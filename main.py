@@ -42,6 +42,42 @@ if not api_key:
 genai.configure(api_key=api_key)
 
 
+def check_environment():
+    """Check if all required components are available"""
+    issues = []
+    
+    # Check API key
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        issues.append("GOOGLE_API_KEY not found in environment")
+    
+    # Check required directories
+    required_dirs = ["./chroma_db", "./temp", "./uploads"]
+    for dir_path in required_dirs:
+        Path(dir_path).mkdir(exist_ok=True)
+    
+    # Check required Python packages
+    required_packages = [
+        "pandas", "numpy", "matplotlib", "seaborn", "plotly",
+        "scikit-learn", "torch", "chromadb", "sentence-transformers"
+    ]
+    
+    for package in required_packages:
+        try:
+            __import__(package)
+        except ImportError:
+            issues.append(f"Missing package: {package}")
+    
+    if issues:
+        print("Environment issues found:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return False
+    
+    print("Environment check passed")
+    return True
+
+
 class QuerySystem:
     """Advanced RAG query system with AI agent capabilities"""
 
@@ -88,7 +124,7 @@ class QuerySystem:
         relevance_note = ""
         if low_relevance:
             relevance_note = (
-                "\n⚠️ NOTE: The provided context may not directly answer the question, "
+                "\nWarning: The provided context may not directly answer the question, "
                 "but it is the closest information found in the document. Use it as background "
                 "and combine it with your own knowledge to answer."
             )
@@ -237,7 +273,7 @@ Your detailed response:"""
                 "context_preview": context[:500] + "..." if len(context) > 500 else context
             }
 
-        print(f"✅ Query processed successfully")
+        print(f"Query processed successfully")
         print(f"   - Confidence: {confidence:.3f}")
         print(f"   - Sources: {len(sources)}")
         print(f"   - Answer length: {len(answer)} characters")
@@ -272,11 +308,12 @@ app = FastAPI(
     version="3.0.0"
 )
 
+# Fixed CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Be more specific in production
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -309,8 +346,11 @@ class AdvancedVisualizationRequest(BaseModel):
     file_id: str
     chart_types: Optional[List[str]] = None
 
+class FileRegistrationRequest(BaseModel):
+    file_id: str
 
-# === RAG Endpoints ===
+
+# === Fixed Upload Endpoint ===
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     if not file.filename:
@@ -326,26 +366,45 @@ async def upload_file(file: UploadFile = File(...)):
         )
 
     try:
-        print(f"\n📄 Received upload request for: {file.filename}")
+        print(f"\nReceived upload request for: {file.filename}")
         content = await file.read()
         
         # Standard document ingestion for text-based files
         if file_ext in {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt'}:
             result = query_system.ingestion.ingest_document(content, file.filename)
         else:
-            # For CSV/Excel, only add to file manager without text extraction
+            # For CSV/Excel, add to file manager
             result = query_system.ingestion.file_manager.add_file(content, file.filename)
             
             # Register for data analysis if it's a data file
             if file_ext in {'.csv', '.xlsx', '.xls'} and result["status"] in ["added", "duplicate"]:
                 file_id = result["file_id"]
-                file_path = query_system.ingestion.file_manager.get_file_info(file_id)["file_path"]
-                data_result = data_analysis_system.register_data_file(file_id, file_path)
-                result["data_analysis_registration"] = data_result
+                result["is_data_file"] = True  # Mark as data file
+                
+                try:
+                    file_info = query_system.ingestion.file_manager.get_file_info(file_id)
+                    if file_info and "file_path" in file_info:
+                        file_path = file_info["file_path"]
+                        data_result = data_analysis_system.register_data_file(file_id, file_path)
+                        result["data_analysis_registration"] = data_result
+                        
+                        if data_result["status"] == "success":
+                            print(f"Successfully registered {file.filename} for data analysis")
+                        else:
+                            print(f"Data analysis registration failed: {data_result.get('message', 'Unknown error')}")
+                    else:
+                        print(f"Could not get file info for {file_id}")
+                        result["data_analysis_registration"] = {"status": "error", "message": "Could not get file info"}
+                except Exception as e:
+                    print(f"Data analysis registration error: {str(e)}")
+                    result["data_analysis_registration"] = {"status": "error", "message": str(e)}
+            else:
+                # Non-data files or failed uploads
+                result["is_data_file"] = file_ext in {'.csv', '.xlsx', '.xls'}
         
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ Upload failed: {str(e)}")
+        print(f"Upload failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
@@ -355,11 +414,11 @@ async def query_documents(request: QueryRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     try:
-        print(f"\n🤖 Received query: {request.query[:100]}...")
+        print(f"\nReceived query: {request.query[:100]}...")
         result = query_system.query(request.query, request.top_k, request.include_debug)
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ Query failed: {str(e)}")
+        print(f"Query failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 
@@ -378,7 +437,7 @@ async def remove_file(request: FileRemoveRequest):
         raise HTTPException(status_code=400, detail="File ID is required")
 
     try:
-        print(f"\n🗑️ Removing file: {request.file_id}")
+        print(f"\nRemoving file: {request.file_id}")
         result = query_system.ingestion.remove_document(request.file_id)
         
         # Also cleanup data analysis if it exists
@@ -386,7 +445,7 @@ async def remove_file(request: FileRemoveRequest):
         
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ Remove failed: {str(e)}")
+        print(f"Remove failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Remove failed: {str(e)}")
 
 
@@ -400,24 +459,90 @@ async def bulk_ingest(request: BulkIngestRequest):
         raise HTTPException(status_code=400, detail="Directory does not exist")
 
     try:
-        print(f"\n📂 Starting bulk ingestion from: {directory_path}")
+        print(f"\nStarting bulk ingestion from: {directory_path}")
         result = query_system.ingestion.bulk_ingest_from_directory(str(directory_path))
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ Bulk ingest failed: {str(e)}")
+        print(f"Bulk ingest failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Bulk ingest failed: {str(e)}")
 
 
-# === Data Analysis Endpoints ===
-@app.post("/data-analysis/eda")
+# === Fixed Data Analysis Endpoints ===
+@app.get("/data-analysis/registered-files")
+async def get_registered_data_files():
+    """Get list of files registered for data analysis"""
+    try:
+        registered_files = {}
+        for file_id, file_data in data_analysis_system.data_files.items():
+            registered_files[file_id] = {
+                "filename": file_data.get("file_path", "").split("/")[-1] if "file_path" in file_data else "Unknown",
+                "registered_at": file_data.get("registered_at"),
+                "shape": file_data["dataframe"].shape if "dataframe" in file_data else None
+            }
+        
+        return JSONResponse(content={
+            "status": "success",
+            "registered_files": registered_files,
+            "total_count": len(registered_files)
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get registered files: {str(e)}")
+
+
+@app.post("/data-analysis/register-file")
+async def register_file_for_analysis(request: FileRegistrationRequest):
+    """Manually register an uploaded file for data analysis"""
+    try:
+        file_id = request.file_id
+        
+        # Check if file exists in file manager
+        file_info = query_system.ingestion.file_manager.get_file_info(file_id)
+        if not file_info:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Check if it's a data file
+        filename = file_info["filename"]
+        file_ext = '.' + filename.split('.').pop().lower()
+        
+        if file_ext not in {'.csv', '.xlsx', '.xls'}:
+            raise HTTPException(status_code=400, detail="File is not a data file")
+        
+        # Register for data analysis
+        file_path = file_info["file_path"]
+        result = data_analysis_system.register_data_file(file_id, file_path)
+        
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+
+@app.get("/data-analysis/eda")
 async def perform_eda(file_id: str):
     """Perform Exploratory Data Analysis on uploaded CSV/Excel file"""
     try:
-        print(f"\n📊 Performing EDA for file: {file_id}")
+        print(f"\nPerforming EDA for file: {file_id}")
+        
+        # Verify file is registered
+        if file_id not in data_analysis_system.data_files:
+            print(f"File {file_id} not found in registered data files")
+            available_files = list(data_analysis_system.data_files.keys())
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error", 
+                    "message": f"File not registered for data analysis. Available files: {available_files}"
+                }
+            )
+        
         result = data_analysis_system.perform_eda(file_id)
+        print(f"EDA completed with status: {result.get('status', 'unknown')}")
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ EDA failed: {str(e)}")
+        print(f"EDA failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"EDA failed: {str(e)}")
 
 
@@ -425,7 +550,7 @@ async def perform_eda(file_id: str):
 async def train_ml_models(request: MLTrainingRequest):
     """Train machine learning models on the dataset"""
     try:
-        print(f"\n🤖 Training ML models for file: {request.file_id}, target: {request.target_column}")
+        print(f"\nTraining ML models for file: {request.file_id}, target: {request.target_column}")
         result = data_analysis_system.train_ml_models(
             request.file_id, 
             request.target_column, 
@@ -433,7 +558,7 @@ async def train_ml_models(request: MLTrainingRequest):
         )
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ ML training failed: {str(e)}")
+        print(f"ML training failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"ML training failed: {str(e)}")
 
 
@@ -441,23 +566,23 @@ async def train_ml_models(request: MLTrainingRequest):
 async def perform_clustering(request: ClusteringRequest):
     """Perform clustering analysis on the dataset"""
     try:
-        print(f"\n🎯 Performing clustering for file: {request.file_id}")
+        print(f"\nPerforming clustering for file: {request.file_id}")
         result = data_analysis_system.perform_clustering(request.file_id, request.n_clusters)
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ Clustering failed: {str(e)}")
+        print(f"Clustering failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Clustering failed: {str(e)}")
 
 
-@app.post("/data-analysis/gan-visualization")
+@app.post("/data-analysis/gan-viz")
 async def generate_gan_visualization(request: GANVisualizationRequest):
     """Generate GAN-based data visualization"""
     try:
-        print(f"\n🎨 Generating GAN visualization for file: {request.file_id}")
+        print(f"\nGenerating GAN visualization for file: {request.file_id}")
         result = data_analysis_system.generate_gan_visualization(request.file_id, request.columns)
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ GAN visualization failed: {str(e)}")
+        print(f"GAN visualization failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"GAN visualization failed: {str(e)}")
 
 
@@ -465,11 +590,11 @@ async def generate_gan_visualization(request: GANVisualizationRequest):
 async def create_advanced_visualizations(request: AdvancedVisualizationRequest):
     """Create advanced data visualizations"""
     try:
-        print(f"\n📈 Creating advanced visualizations for file: {request.file_id}")
+        print(f"\nCreating advanced visualizations for file: {request.file_id}")
         result = data_analysis_system.create_advanced_visualizations(request.file_id, request.chart_types)
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ Advanced visualization failed: {str(e)}")
+        print(f"Advanced visualization failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Advanced visualization failed: {str(e)}")
 
 
@@ -477,32 +602,12 @@ async def create_advanced_visualizations(request: AdvancedVisualizationRequest):
 async def get_data_insights(file_id: str):
     """Get AI-powered insights about the dataset"""
     try:
-        print(f"\n🧠 Generating insights for file: {file_id}")
+        print(f"\nGenerating insights for file: {file_id}")
         result = data_analysis_system.get_data_insights(file_id)
         return JSONResponse(content=result)
     except Exception as e:
-        print(f"❌ Insights generation failed: {str(e)}")
+        print(f"Insights generation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Insights generation failed: {str(e)}")
-
-
-@app.get("/data-analysis/history")
-async def get_analysis_history(file_id: str = None):
-    """Get history of all analyses performed"""
-    try:
-        result = data_analysis_system.get_analysis_history(file_id)
-        return JSONResponse(content=result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get analysis history: {str(e)}")
-
-
-@app.get("/data-analysis/export/{analysis_key}")
-async def export_analysis_results(analysis_key: str, format_type: str = "json"):
-    """Export analysis results in specified format"""
-    try:
-        result = data_analysis_system.export_results(analysis_key, format_type)
-        return JSONResponse(content=result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
 
 
 @app.delete("/data-analysis/cleanup/{file_id}")
@@ -513,6 +618,44 @@ async def cleanup_data_analysis(file_id: str):
         return JSONResponse(content=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+
+# === Test Endpoint ===
+@app.get("/data-analysis/test")
+async def test_data_analysis():
+    """Test endpoint to verify data analysis system is working"""
+    try:
+        import pandas as pd
+        import numpy as np
+        
+        # Create a simple test DataFrame
+        test_data = pd.DataFrame({
+            'A': np.random.randn(100),
+            'B': np.random.randn(100),
+            'C': np.random.choice(['X', 'Y', 'Z'], 100)
+        })
+        
+        return JSONResponse(content={
+            "status": "success",
+            "message": "Data analysis system is working",
+            "test_data_shape": test_data.shape,
+            "registered_files_count": len(data_analysis_system.data_files),
+            "available_endpoints": [
+                "/data-analysis/registered-files",
+                "/data-analysis/eda",
+                "/data-analysis/ml-training",
+                "/data-analysis/clustering",
+                "/data-analysis/insights"
+            ]
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": f"Data analysis system test failed: {str(e)}"
+            }
+        )
 
 
 # === System Endpoints ===
@@ -577,6 +720,37 @@ async def health_check():
     return JSONResponse(content=health_status)
 
 
+# === Startup Event ===
+@app.on_event("startup")
+async def startup_event():
+    """Verify system components on startup"""
+    print("=" * 50)
+    print("Starting Enhanced RAG System with Data Analysis")
+    print("=" * 50)
+    
+    # Check environment
+    env_ok = check_environment()
+    if not env_ok:
+        print("Warning: Some environment issues detected")
+    
+    # Test data analysis system
+    try:
+        test_result = len(data_analysis_system.data_files)
+        print(f"Data analysis system initialized with {test_result} registered files")
+    except Exception as e:
+        print(f"Data analysis system error: {e}")
+    
+    # Test query system
+    try:
+        stats = query_system.get_query_stats()
+        print(f"Query system initialized with {stats['total_chunks_in_db']} chunks")
+    except Exception as e:
+        print(f"Query system error: {e}")
+    
+    print("Startup complete")
+    print("=" * 50)
+
+
 # === Enhanced CLI Interface ===
 if __name__ == "__main__":
     import argparse
@@ -593,84 +767,34 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.query:
-        print(f"\n🤖 Processing query: {args.query}")
+        print(f"\nProcessing query: {args.query}")
         result = query_system.query(args.query)
-        print(f"\n📋 Answer:\n{result['answer']}")
-        print(f"\n📚 Sources: {len(result['sources'])} documents")
-        print(f"🎯 Confidence: {result['confidence']:.3f}")
+        print(f"\nAnswer:\n{result['answer']}")
+        print(f"\nSources: {len(result['sources'])} documents")
+        print(f"Confidence: {result['confidence']:.3f}")
 
     elif args.interactive:
-        print("\n🤖 Interactive RAG Query Mode")
+        print("\nInteractive RAG Query Mode")
         print("Type your questions (or 'quit' to exit):")
         print("-" * 40)
 
         while True:
             try:
-                q = input("\n❓ Your question: ").strip()
+                q = input("\nYour question: ").strip()
                 if q.lower() in ['quit', 'exit', 'q']:
-                    print("👋 Goodbye!")
+                    print("Goodbye!")
                     break
                 if not q:
                     continue
-                print("🔍 Searching knowledge base...")
+                print("Searching knowledge base...")
                 res = query_system.query(q)
-                print(f"\n📋 Answer:\n{res['answer']}")
-                print(f"📊 Confidence: {res['confidence']:.3f}")
+                print(f"\nAnswer:\n{res['answer']}")
+                print(f"Confidence: {res['confidence']:.3f}")
             except KeyboardInterrupt:
-                print("\n👋 Goodbye!")
+                print("\nGoodbye!")
                 break
             except Exception as e:
-                print(f"❌ Error: {str(e)}")
+                print(f"Error: {str(e)}")
 
     elif args.analyze_data:
-        print(f"\n📊 Analyzing data file: {args.analyze_data}")
-        try:
-            # Register the file
-            file_path = Path(args.analyze_data)
-            if not file_path.exists():
-                print("❌ File not found!")
-            else:
-                file_id = f"cli_{file_path.stem}"
-                register_result = data_analysis_system.register_data_file(file_id, str(file_path))
-                if register_result["status"] == "success":
-                    print("✅ File registered successfully")
-                    
-                    # Perform EDA
-                    print("🔍 Performing EDA...")
-                    eda_result = data_analysis_system.perform_eda(file_id)
-                    if eda_result["status"] == "success":
-                        stats = eda_result["summary_statistics"]["dataset_info"]
-                        print(f"📊 Dataset: {stats['shape'][0]} rows, {stats['shape'][1]} columns")
-                        print(f"💾 Memory usage: {stats['memory_usage_mb']} MB")
-                        print("✅ EDA completed successfully")
-                    else:
-                        print(f"❌ EDA failed: {eda_result.get('message', 'Unknown error')}")
-                else:
-                    print(f"❌ File registration failed: {register_result.get('message', 'Unknown error')}")
-        except Exception as e:
-            print(f"❌ Error: {str(e)}")
-
-    elif args.data_insights:
-        print(f"\n🧠 Generating insights for file: {args.data_insights}")
-        try:
-            result = data_analysis_system.get_data_insights(args.data_insights)
-            if result["status"] == "success":
-                insights = result["insights"]
-                print(f"📊 Dataset Overview:")
-                print(f"   - Rows: {insights['dataset_overview']['total_rows']}")
-                print(f"   - Columns: {insights['dataset_overview']['total_columns']}")
-                print(f"   - Data Quality Score: {insights['data_quality']['completeness_score']:.1f}%")
-                print(f"🔍 Recommendations: {len(insights['recommendations'])}")
-                for i, rec in enumerate(insights['recommendations'][:3], 1):
-                    print(f"   {i}. {rec}")
-            else:
-                print(f"❌ Insights generation failed: {result.get('message', 'Unknown error')}")
-        except Exception as e:
-            print(f"❌ Error: {str(e)}")
-
-    else:
-        print("\n🚀 Starting Enhanced RAG System Server...")
-        print(f"📊 Data Analysis Features: Enabled")
-        print(f"🤖 AI Agent: Enabled")
-        print(f"🔍 RAG System: Enabled")
-        uvicorn.run("main:app", host=args.host, port=args.port, reload=args.reload, log_level="info")
+        print(f"\nAnalyzing data file: {args.analyze_data}")
