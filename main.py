@@ -29,7 +29,7 @@ from data_analysis import DataAnalysisSystem
 CHROMA_DIR = "./chroma_db"
 COLLECTION_NAME = "document_store"
 EMBED_MODEL = "all-MiniLM-L6-v2"
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 TOP_K = 10
 RELEVANCE_THRESHOLD = 1.2  # Distance threshold for relevance
 # ----------------------------
