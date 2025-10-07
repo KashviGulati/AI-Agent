@@ -1,6 +1,5 @@
 """
 main.py - RAG Query System and FastAPI Server with Data Analysis
-Handles querying, AI responses, API endpoints, and comprehensive data analysis
 """
 
 import os
@@ -8,167 +7,63 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from pathlib import Path
 
-# FastAPI and web
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-# ChromaDB and AI
 import chromadb
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from dotenv import load_dotenv
 
-# Import our systems
 from ingest import DocumentIngestion
 from data_analysis import DataAnalysisSystem
 
-# ---------- CONFIG ----------
+# Config
 CHROMA_DIR = "./chroma_db"
 COLLECTION_NAME = "document_store"
 EMBED_MODEL = "all-MiniLM-L6-v2"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash-exp"
 TOP_K = 10
-RELEVANCE_THRESHOLD = 1.2  # Distance threshold for relevance
-# ----------------------------
+RELEVANCE_THRESHOLD = 1.2
 
-# Load environment variables
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
-    raise ValueError("GOOGLE_API_KEY not found in environment. Add it to .env file.")
+    raise ValueError("GOOGLE_API_KEY not found in environment")
 genai.configure(api_key=api_key)
 
 
-def check_environment():
-    """Check if all required components are available"""
-    issues = []
-    
-    # Check API key
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        issues.append("GOOGLE_API_KEY not found in environment")
-    
-    # Check required directories
-    required_dirs = ["./chroma_db", "./temp", "./uploads"]
-    for dir_path in required_dirs:
-        Path(dir_path).mkdir(exist_ok=True)
-    
-    # Check required Python packages
-    required_packages = [
-        "pandas", "numpy", "matplotlib", "seaborn", "plotly",
-        "scikit-learn", "torch", "chromadb", "sentence-transformers"
-    ]
-    
-    for package in required_packages:
-        try:
-            __import__(package)
-        except ImportError:
-            issues.append(f"Missing package: {package}")
-    
-    if issues:
-        print("Environment issues found:")
-        for issue in issues:
-            print(f"  - {issue}")
-        return False
-    
-    print("Environment check passed")
-    return True
-
-
 class QuerySystem:
-    """Advanced RAG query system with AI agent capabilities"""
-
     def __init__(self):
-        # Initialize ChromaDB connection
         self.client = chromadb.PersistentClient(path=CHROMA_DIR)
         try:
             self.collection = self.client.get_collection(name=COLLECTION_NAME)
-        except Exception:
+        except:
             self.collection = self.client.create_collection(name=COLLECTION_NAME)
-
-        # Initialize ingestion system (for file management)
         self.ingestion = DocumentIngestion()
-
-        # Lazy load models
         self.embedder = None
         self.gemini_model = None
 
     def _load_models(self):
-        """Load AI models lazily"""
         if self.embedder is None:
-            print("Loading embedding model for queries...")
             self.embedder = SentenceTransformer(EMBED_MODEL)
-
         if self.gemini_model is None:
-            print("Loading Gemini model...")
-            self.gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-
-    def _create_enhanced_prompt(self, query: str, context: str, context_metadata: List[Dict], low_relevance=False) -> str:
-        """Create an enhanced prompt for the AI agent"""
-        # Analyze context sources
-        source_info = {}
-        for meta in context_metadata:
-            filename = meta.get("filename", "Unknown")
-            if filename not in source_info:
-                source_info[filename] = {"chunks": 0, "total_chunks": meta.get("total_chunks", 0)}
-            source_info[filename]["chunks"] += 1
-
-        source_summary = "\n".join([
-            f"- {filename}: {info['chunks']} relevant sections (out of {info['total_chunks']} total)"
-            for filename, info in source_info.items()
-        ])
-
-        relevance_note = ""
-        if low_relevance:
-            relevance_note = (
-                "\nWarning: The provided context may not directly answer the question, "
-                "but it is the closest information found in the document. Use it as background "
-                "and combine it with your own knowledge to answer."
+            self.gemini_model = genai.GenerativeModel(
+                GEMINI_MODEL,
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
             )
 
-        return f"""You are an expert AI assistant with access to a comprehensive knowledge base. 
-Your role is to provide accurate, detailed, and actionable responses based on the provided context.
-
-KNOWLEDGE BASE SOURCES:
-{source_summary}
-{relevance_note}
-
-ANALYSIS INSTRUCTIONS:
-1. Carefully read and analyze ALL provided context chunks
-2. Synthesize information from multiple sources when relevant
-3. If context does not fully answer the query, use your own reasoning and knowledge to provide a relevant, accurate answer
-4. Clearly distinguish between information from the document and your own inferred knowledge
-5. Structure your response for maximum clarity and usefulness
-
-USER QUERY: {query}
-
-RELEVANT CONTEXT:
-{context}
-
-Your detailed response:"""
-
-    def _calculate_confidence(self, distances: List[float], num_chunks: int) -> float:
-        """Calculate confidence score based on relevance and coverage"""
-        if not distances:
-            return 0.0
-
-        avg_relevance = sum(1 - d for d in distances) / len(distances)
-        coverage_factor = min(num_chunks / 5, 1.0)  # Cap at 5 chunks
-
-        confidence = (avg_relevance * 0.7) + (coverage_factor * 0.3)
-        return min(confidence, 1.0)
-
     def query(self, query: str, top_k: int = TOP_K, include_debug: bool = False) -> Dict:
-        """Main query method with enhanced AI agent response"""
-        print(f"\n=== Processing Query ===")
-        print(f"Query: {query}")
-        print(f"Retrieving top {top_k} chunks...")
-
         self._load_models()
-
         query_embedding = self.embedder.encode(query).tolist()
 
         try:
@@ -178,623 +73,203 @@ Your detailed response:"""
                 include=["documents", "metadatas", "distances"]
             )
         except Exception as e:
-            return {
-                "answer": f"Error searching knowledge base: {str(e)}",
-                "sources": [],
-                "confidence": 0.0,
-                "status": "error"
-            }
+            return {"answer": f"Error: {str(e)}", "sources": [], "confidence": 0.0, "status": "error"}
 
         if not results["documents"] or not results["documents"][0]:
-            return {
-                "answer": "No documents found in the knowledge base. Please upload some documents first.",
-                "sources": [],
-                "confidence": 0.0,
-                "status": "no_results"
-            }
+            return {"answer": "No documents found.", "sources": [], "confidence": 0.0, "status": "no_results"}
 
         docs = results["documents"][0]
         metadatas = results["metadatas"][0]
         distances = results["distances"][0]
 
-        # First pass: strict relevance filter
-        relevant_docs = []
-        relevant_metadata = []
-        relevant_distances = []
+        relevant_docs = [doc for doc, dist in zip(docs, distances) if dist <= RELEVANCE_THRESHOLD]
+        relevant_metadata = [meta for meta, dist in zip(metadatas, distances) if dist <= RELEVANCE_THRESHOLD]
+        relevant_distances = [dist for dist in distances if dist <= RELEVANCE_THRESHOLD]
 
-        for doc, meta, dist in zip(docs, metadatas, distances):
-            if dist <= RELEVANCE_THRESHOLD:
-                relevant_docs.append(doc)
-                relevant_metadata.append(meta)
-                relevant_distances.append(dist)
-
-        low_relevance_mode = False
         if not relevant_docs:
-            # Fallback: take top_k anyway, but mark as low relevance
-            relevant_docs = docs
-            relevant_metadata = metadatas
-            relevant_distances = distances
-            low_relevance_mode = True
+            relevant_docs, relevant_metadata, relevant_distances = docs, metadatas, distances
 
-        print(f"Found {len(relevant_docs)} chunks (low_relevance_mode={low_relevance_mode})")
-
-        # Prepare sources
         sources = [
             {
                 "filename": meta.get("filename", "Unknown"),
                 "chunk_index": meta.get("chunk_index", 0),
-                "total_chunks": meta.get("total_chunks", 0),
-                "relevance_score": round(1 - dist, 3),
-                "upload_time": meta.get("upload_time", "Unknown")
+                "relevance_score": round(1 - dist, 3)
             }
             for meta, dist in zip(relevant_metadata, relevant_distances)
         ]
 
-        # Create context
-        context = "\n\n---DOCUMENT CHUNK---\n\n".join(relevant_docs)
+        context = "\n\n---\n\n".join(relevant_docs)
+        prompt = f"""You are an AI assistant. Answer based on the context provided.
 
-        # Build prompt
-        prompt = self._create_enhanced_prompt(query, context, relevant_metadata, low_relevance=low_relevance_mode)
+Query: {query}
 
-        # Get AI answer
+Context:
+{context}
+
+Response:"""
+
         try:
-            print("Generating AI response...")
             response = self.gemini_model.generate_content(
                 prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.3,
-                    max_output_tokens=2048,
-                )
+                generation_config=genai.types.GenerationConfig(temperature=0.3, max_output_tokens=2048)
             )
-            answer = response.text.strip() if response and hasattr(response, "text") else "No response generated"
+            answer = response.text.strip() if response and hasattr(response, "text") else "No response"
         except Exception as e:
-            print(f"Error generating AI response: {e}")
-            answer = f"Error generating response: {str(e)}"
+            answer = f"Error: {str(e)}"
 
-        # Confidence score
-        confidence = self._calculate_confidence(relevant_distances, len(relevant_docs))
+        confidence = sum(1 - d for d in relevant_distances) / len(relevant_distances) if relevant_distances else 0
 
-        result = {
+        return {
             "answer": answer,
             "sources": sources,
             "confidence": round(confidence, 3),
             "total_chunks_found": len(relevant_docs),
-            "query_processed": query,
             "status": "success"
         }
 
-        if include_debug:
-            result["debug"] = {
-                "all_distances": distances,
-                "relevance_threshold": RELEVANCE_THRESHOLD,
-                "chunks_before_filtering": len(docs),
-                "chunks_after_filtering": len(relevant_docs),
-                "low_relevance_mode": low_relevance_mode,
-                "context_preview": context[:500] + "..." if len(context) > 500 else context
-            }
 
-        print(f"Query processed successfully")
-        print(f"   - Confidence: {confidence:.3f}")
-        print(f"   - Sources: {len(sources)}")
-        print(f"   - Answer length: {len(answer)} characters")
-
-        return result
-
-    def get_query_stats(self) -> Dict:
-        """Get query system statistics"""
-        try:
-            collection_count = self.collection.count()
-        except:
-            collection_count = 0
-        
-        return {
-            "total_chunks_in_db": collection_count,
-            "embedding_model": EMBED_MODEL,
-            "ai_model": GEMINI_MODEL,
-            "top_k": TOP_K,
-            "relevance_threshold": RELEVANCE_THRESHOLD
-        }
-
-
-# === FastAPI setup ===
-print("Initializing Enhanced RAG System with Data Analysis...")
+# FastAPI Setup
 query_system = QuerySystem()
 data_analysis_system = DataAnalysisSystem()
-print("Systems initialized successfully!")
 
-app = FastAPI(
-    title="Enhanced RAG System with Data Analysis",
-    description="Document ingestion, intelligent querying, and comprehensive data analysis system",
-    version="3.0.0"
-)
+app = FastAPI(title="RAG System", version="3.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# Fixed CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Be more specific in production
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
 
-# Pydantic models
+# Pydantic Models
 class QueryRequest(BaseModel):
     query: str
     top_k: int = TOP_K
-    include_debug: bool = False
 
 class FileRemoveRequest(BaseModel):
     file_id: str
 
-class BulkIngestRequest(BaseModel):
-    directory_path: str
-
 class MLTrainingRequest(BaseModel):
     file_id: str
     target_column: str
-    task_type: str = "auto"  # "auto", "classification", "regression"
+    task_type: str = "auto"
 
 class ClusteringRequest(BaseModel):
     file_id: str
     n_clusters: Optional[int] = None
 
-class GANVisualizationRequest(BaseModel):
-    file_id: str
-    columns: Optional[List[str]] = None
 
-class AdvancedVisualizationRequest(BaseModel):
-    file_id: str
-    chart_types: Optional[List[str]] = None
-
-class FileRegistrationRequest(BaseModel):
-    file_id: str
-
-
-# === Fixed Upload Endpoint ===
+# Endpoints
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
+        raise HTTPException(400, "No filename")
 
-    allowed_extensions = {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.csv', '.xlsx', '.xls'}
     file_ext = Path(file.filename).suffix.lower()
-
-    if file_ext not in allowed_extensions:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{file_ext}'. Allowed: {', '.join(allowed_extensions)}"
-        )
+    allowed = {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.csv', '.xlsx', '.xls'}
+    if file_ext not in allowed:
+        raise HTTPException(400, f"Unsupported type: {file_ext}")
 
     try:
-        print(f"\nReceived upload request for: {file.filename}")
         content = await file.read()
-        
-        # Standard document ingestion for text-based files
         if file_ext in {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt'}:
             result = query_system.ingestion.ingest_document(content, file.filename)
         else:
-            # For CSV/Excel, add to file manager
             result = query_system.ingestion.file_manager.add_file(content, file.filename)
-            
-            # Register for data analysis if it's a data file
             if file_ext in {'.csv', '.xlsx', '.xls'} and result["status"] in ["added", "duplicate"]:
-                file_id = result["file_id"]
-                result["is_data_file"] = True  # Mark as data file
-                
-                try:
-                    file_info = query_system.ingestion.file_manager.get_file_info(file_id)
-                    if file_info and "file_path" in file_info:
-                        file_path = file_info["file_path"]
-                        data_result = data_analysis_system.register_data_file(file_id, file_path)
-                        result["data_analysis_registration"] = data_result
-                        
-                        if data_result["status"] == "success":
-                            print(f"Successfully registered {file.filename} for data analysis")
-                        else:
-                            print(f"Data analysis registration failed: {data_result.get('message', 'Unknown error')}")
-                    else:
-                        print(f"Could not get file info for {file_id}")
-                        result["data_analysis_registration"] = {"status": "error", "message": "Could not get file info"}
-                except Exception as e:
-                    print(f"Data analysis registration error: {str(e)}")
-                    result["data_analysis_registration"] = {"status": "error", "message": str(e)}
-            else:
-                # Non-data files or failed uploads
-                result["is_data_file"] = file_ext in {'.csv', '.xlsx', '.xls'}
-        
-        return JSONResponse(content=result)
+                file_info = query_system.ingestion.file_manager.get_file_info(result["file_id"])
+                if file_info:
+                    data_analysis_system.register_data_file(result["file_id"], file_info["file_path"])
+        return JSONResponse(result)
     except Exception as e:
-        print(f"Upload failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+        raise HTTPException(500, str(e))
 
 
 @app.post("/query")
 async def query_documents(request: QueryRequest):
     if not request.query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
-
+        raise HTTPException(400, "Empty query")
     try:
-        print(f"\nReceived query: {request.query[:100]}...")
-        result = query_system.query(request.query, request.top_k, request.include_debug)
-        return JSONResponse(content=result)
+        result = query_system.query(request.query, request.top_k)
+        return JSONResponse(result)
     except Exception as e:
-        print(f"Query failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+        raise HTTPException(500, str(e))
 
 
 @app.get("/files")
 async def list_files():
-    try:
-        result = query_system.ingestion.list_files()
-        return JSONResponse(content=result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"List files failed: {str(e)}")
+    return JSONResponse(query_system.ingestion.list_files())
 
 
 @app.delete("/remove")
 async def remove_file(request: FileRemoveRequest):
-    if not request.file_id:
-        raise HTTPException(status_code=400, detail="File ID is required")
-
-    try:
-        print(f"\nRemoving file: {request.file_id}")
-        result = query_system.ingestion.remove_document(request.file_id)
-        
-        # Also cleanup data analysis if it exists
-        data_analysis_system.cleanup_analysis(request.file_id)
-        
-        return JSONResponse(content=result)
-    except Exception as e:
-        print(f"Remove failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Remove failed: {str(e)}")
-
-
-@app.post("/bulk-ingest")
-async def bulk_ingest(request: BulkIngestRequest):
-    if not request.directory_path:
-        raise HTTPException(status_code=400, detail="Directory path is required")
-
-    directory_path = Path(request.directory_path)
-    if not directory_path.exists():
-        raise HTTPException(status_code=400, detail="Directory does not exist")
-
-    try:
-        print(f"\nStarting bulk ingestion from: {directory_path}")
-        result = query_system.ingestion.bulk_ingest_from_directory(str(directory_path))
-        return JSONResponse(content=result)
-    except Exception as e:
-        print(f"Bulk ingest failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Bulk ingest failed: {str(e)}")
-
-
-# === Fixed Data Analysis Endpoints ===
-@app.get("/data-analysis/registered-files")
-async def get_registered_data_files():
-    """Get list of files registered for data analysis"""
-    try:
-        registered_files = {}
-        for file_id, file_data in data_analysis_system.data_files.items():
-            registered_files[file_id] = {
-                "filename": file_data.get("file_path", "").split("/")[-1] if "file_path" in file_data else "Unknown",
-                "registered_at": file_data.get("registered_at"),
-                "shape": file_data["dataframe"].shape if "dataframe" in file_data else None
-            }
-        
-        return JSONResponse(content={
-            "status": "success",
-            "registered_files": registered_files,
-            "total_count": len(registered_files)
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get registered files: {str(e)}")
-
-
-@app.post("/data-analysis/register-file")
-async def register_file_for_analysis(request: FileRegistrationRequest):
-    """Manually register an uploaded file for data analysis"""
-    try:
-        file_id = request.file_id
-        
-        # Check if file exists in file manager
-        file_info = query_system.ingestion.file_manager.get_file_info(file_id)
-        if not file_info:
-            raise HTTPException(status_code=404, detail="File not found")
-        
-        # Check if it's a data file
-        filename = file_info["filename"]
-        file_ext = '.' + filename.split('.').pop().lower()
-        
-        if file_ext not in {'.csv', '.xlsx', '.xls'}:
-            raise HTTPException(status_code=400, detail="File is not a data file")
-        
-        # Register for data analysis
-        file_path = file_info["file_path"]
-        result = data_analysis_system.register_data_file(file_id, file_path)
-        
-        return JSONResponse(content=result)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+    result = query_system.ingestion.remove_document(request.file_id)
+    data_analysis_system.cleanup_analysis(request.file_id)
+    return JSONResponse(result)
 
 
 @app.get("/data-analysis/eda")
 async def perform_eda(file_id: str):
-    """Perform Exploratory Data Analysis on uploaded CSV/Excel file"""
-    try:
-        print(f"\nPerforming EDA for file: {file_id}")
-        
-        # Verify file is registered
-        if file_id not in data_analysis_system.data_files:
-            print(f"File {file_id} not found in registered data files")
-            available_files = list(data_analysis_system.data_files.keys())
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "status": "error", 
-                    "message": f"File not registered for data analysis. Available files: {available_files}"
-                }
-            )
-        
-        result = data_analysis_system.perform_eda(file_id)
-        print(f"EDA completed with status: {result.get('status', 'unknown')}")
-        return JSONResponse(content=result)
-    except Exception as e:
-        print(f"EDA failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"EDA failed: {str(e)}")
+    if file_id not in data_analysis_system.data_files:
+        raise HTTPException(404, "File not registered")
+    return JSONResponse(data_analysis_system.perform_eda(file_id))
 
 
 @app.post("/data-analysis/ml-training")
 async def train_ml_models(request: MLTrainingRequest):
-    """Train machine learning models on the dataset"""
-    try:
-        print(f"\nTraining ML models for file: {request.file_id}, target: {request.target_column}")
-        result = data_analysis_system.train_ml_models(
-            request.file_id, 
-            request.target_column, 
-            request.task_type
-        )
-        return JSONResponse(content=result)
-    except Exception as e:
-        print(f"ML training failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"ML training failed: {str(e)}")
+    result = data_analysis_system.train_ml_models(request.file_id, request.target_column, request.task_type)
+    return JSONResponse(result)
 
 
 @app.post("/data-analysis/clustering")
 async def perform_clustering(request: ClusteringRequest):
-    """Perform clustering analysis on the dataset"""
-    try:
-        print(f"\nPerforming clustering for file: {request.file_id}")
-        result = data_analysis_system.perform_clustering(request.file_id, request.n_clusters)
-        return JSONResponse(content=result)
-    except Exception as e:
-        print(f"Clustering failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Clustering failed: {str(e)}")
-
-
-@app.post("/data-analysis/gan-viz")
-async def generate_gan_visualization(request: GANVisualizationRequest):
-    """Generate GAN-based data visualization"""
-    try:
-        print(f"\nGenerating GAN visualization for file: {request.file_id}")
-        result = data_analysis_system.generate_gan_visualization(request.file_id, request.columns)
-        return JSONResponse(content=result)
-    except Exception as e:
-        print(f"GAN visualization failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"GAN visualization failed: {str(e)}")
-
-
-@app.post("/data-analysis/advanced-visualizations")
-async def create_advanced_visualizations(request: AdvancedVisualizationRequest):
-    """Create advanced data visualizations"""
-    try:
-        print(f"\nCreating advanced visualizations for file: {request.file_id}")
-        result = data_analysis_system.create_advanced_visualizations(request.file_id, request.chart_types)
-        return JSONResponse(content=result)
-    except Exception as e:
-        print(f"Advanced visualization failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Advanced visualization failed: {str(e)}")
+    result = data_analysis_system.perform_clustering(request.file_id, request.n_clusters)
+    return JSONResponse(result)
 
 
 @app.get("/data-analysis/insights/{file_id}")
-async def get_data_insights(file_id: str):
-    """Get AI-powered insights about the dataset"""
-    try:
-        print(f"\nGenerating insights for file: {file_id}")
-        result = data_analysis_system.get_data_insights(file_id)
-        return JSONResponse(content=result)
-    except Exception as e:
-        print(f"Insights generation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Insights generation failed: {str(e)}")
+async def get_insights(file_id: str):
+    return JSONResponse(data_analysis_system.get_data_insights(file_id))
 
 
-@app.delete("/data-analysis/cleanup/{file_id}")
-async def cleanup_data_analysis(file_id: str):
-    """Clean up analysis data for a specific file"""
-    try:
-        result = data_analysis_system.cleanup_analysis(file_id)
-        return JSONResponse(content=result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
-
-
-# === Test Endpoint ===
-@app.get("/data-analysis/test")
-async def test_data_analysis():
-    """Test endpoint to verify data analysis system is working"""
-    try:
-        import pandas as pd
-        import numpy as np
-        
-        # Create a simple test DataFrame
-        test_data = pd.DataFrame({
-            'A': np.random.randn(100),
-            'B': np.random.randn(100),
-            'C': np.random.choice(['X', 'Y', 'Z'], 100)
-        })
-        
-        return JSONResponse(content={
-            "status": "success",
-            "message": "Data analysis system is working",
-            "test_data_shape": test_data.shape,
-            "registered_files_count": len(data_analysis_system.data_files),
-            "available_endpoints": [
-                "/data-analysis/registered-files",
-                "/data-analysis/eda",
-                "/data-analysis/ml-training",
-                "/data-analysis/clustering",
-                "/data-analysis/insights"
-            ]
-        })
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": f"Data analysis system test failed: {str(e)}"
-            }
-        )
-
-
-# === System Endpoints ===
 @app.get("/stats")
 async def get_stats():
-    try:
-        ingestion_stats = query_system.ingestion.get_ingestion_stats()
-        query_stats = query_system.get_query_stats()
-        
-        # Get data analysis stats
-        data_analysis_stats = {
-            "registered_data_files": len(data_analysis_system.data_files),
-            "total_analyses_performed": len(data_analysis_system.analysis_results),
-            "available_analysis_types": [
-                "EDA", "ML Training", "Clustering", "GAN Visualization", 
-                "Advanced Visualizations", "Data Insights"
-            ]
-        }
-
-        combined_stats = {
-            "system_status": "operational",
-            "timestamp": datetime.now().isoformat(),
-            "ingestion": ingestion_stats,
-            "querying": query_stats,
-            "data_analysis": data_analysis_stats
-        }
-        return JSONResponse(content=combined_stats)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stats failed: {str(e)}")
+    return JSONResponse({
+        "timestamp": datetime.now().isoformat(),
+        "ingestion": query_system.ingestion.get_ingestion_stats(),
+        "total_chunks": query_system.collection.count(),
+        "registered_files": len(data_analysis_system.data_files)
+    })
 
 
 @app.get("/health")
-async def health_check():
-    health_status = {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "components": {}
-    }
-
-    try:
-        query_system.collection.count()
-        health_status["components"]["chromadb"] = "healthy"
-    except Exception as e:
-        health_status["components"]["chromadb"] = f"unhealthy: {str(e)}"
-        health_status["status"] = "degraded"
-
-    try:
-        query_system._load_models()
-        health_status["components"]["ai_models"] = "healthy"
-    except Exception as e:
-        health_status["components"]["ai_models"] = f"unhealthy: {str(e)}"
-        health_status["status"] = "degraded"
-
-    try:
-        # Test data analysis system
-        len(data_analysis_system.data_files)
-        health_status["components"]["data_analysis"] = "healthy"
-    except Exception as e:
-        health_status["components"]["data_analysis"] = f"unhealthy: {str(e)}"
-        health_status["status"] = "degraded"
-
-    return JSONResponse(content=health_status)
+async def health():
+    return JSONResponse({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 
-# === Startup Event ===
-@app.on_event("startup")
-async def startup_event():
-    """Verify system components on startup"""
-    print("=" * 50)
-    print("Starting Enhanced RAG System with Data Analysis")
-    print("=" * 50)
-    
-    # Check environment
-    env_ok = check_environment()
-    if not env_ok:
-        print("Warning: Some environment issues detected")
-    
-    # Test data analysis system
-    try:
-        test_result = len(data_analysis_system.data_files)
-        print(f"Data analysis system initialized with {test_result} registered files")
-    except Exception as e:
-        print(f"Data analysis system error: {e}")
-    
-    # Test query system
-    try:
-        stats = query_system.get_query_stats()
-        print(f"Query system initialized with {stats['total_chunks_in_db']} chunks")
-    except Exception as e:
-        print(f"Query system error: {e}")
-    
-    print("Startup complete")
-    print("=" * 50)
-
-
-# === Enhanced CLI Interface ===
+# CLI
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Enhanced RAG System with Data Analysis")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
-    parser.add_argument("--query", type=str, help="Run a single query from command line")
-    parser.add_argument("--interactive", action="store_true", help="Start interactive query mode")
-    parser.add_argument("--analyze-data", type=str, help="Perform data analysis on a CSV/Excel file")
-    parser.add_argument("--data-insights", type=str, help="Get insights for a registered data file")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["server", "cli"], default="server")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload (dev only)")
     args = parser.parse_args()
 
-    if args.query:
-        print(f"\nProcessing query: {args.query}")
-        result = query_system.query(args.query)
-        print(f"\nAnswer:\n{result['answer']}")
-        print(f"\nSources: {len(result['sources'])} documents")
-        print(f"Confidence: {result['confidence']:.3f}")
-
-    elif args.interactive:
-        print("\nInteractive RAG Query Mode")
-        print("Type your questions (or 'quit' to exit):")
-        print("-" * 40)
-
+    if args.mode == "server":
+        print(f"Starting server on {args.host}:{args.port}")
+        # Fix for Windows multiprocessing with reload
+        if args.reload:
+            uvicorn.run("main:app", host=args.host, port=args.port, reload=True, reload_dirs=["."])
+        else:
+            uvicorn.run(app, host=args.host, port=args.port)
+    else:
+        system = QuerySystem()
+        print("RAG System CLI - Type 'exit' to quit")
         while True:
             try:
-                q = input("\nYour question: ").strip()
-                if q.lower() in ['quit', 'exit', 'q']:
-                    print("Goodbye!")
+                user_input = input("\nQuery> ").strip()
+                if user_input.lower() in ["exit", "quit"]:
                     break
-                if not q:
-                    continue
-                print("Searching knowledge base...")
-                res = query_system.query(q)
-                print(f"\nAnswer:\n{res['answer']}")
-                print(f"Confidence: {res['confidence']:.3f}")
+                if user_input:
+                    result = system.query(user_input)
+                    print(f"\n{result['answer']}\n")
+                    print(f"Confidence: {result['confidence']:.2%} | Sources: {result['total_chunks_found']}")
             except KeyboardInterrupt:
-                print("\nGoodbye!")
                 break
-            except Exception as e:
-                print(f"Error: {str(e)}")
-
-    elif args.analyze_data:
-        print(f"\nAnalyzing data file: {args.analyze_data}")
